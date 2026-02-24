@@ -1,0 +1,6 @@
+moderngl>=5.10.0
+moderngl-window>=2.4.0
+imgui>=2.0.0
+numpy>=2.0.0
+Pillow>=10.0.0
+robotpy>=2026.2.1.1
