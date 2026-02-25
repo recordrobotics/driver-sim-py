@@ -270,9 +270,9 @@ class RealtimeRenderer(mglw.WindowConfig):
         )
         self._light_colors = np.array(
             [
-                (0.25, 0.45, 1.0),
-                (1.0, 0.25, 0.25),
-                (1.0, 1.0, 1.0),
+                (0.25, 0.45, 1.0, 1.0),
+                (1.0, 0.25, 0.25, 1.0),
+                (1.0, 1.0, 1.0, 1.0),
             ],
             dtype=np.float32,
         )
@@ -297,7 +297,9 @@ class RealtimeRenderer(mglw.WindowConfig):
             ],
             dtype=np.float32,
         )
-        self._light_positions_view = self._light_positions_world.copy()
+        self._light_positions_view = np.column_stack(
+            (self._light_positions_world, np.ones(len(self._light_positions_world), dtype=np.float32))
+        )
         self._light_program_cache: set[int] = set()
         self._staged_fuel_nodes: dict[Any, Any] = {}
 
@@ -489,7 +491,7 @@ class RealtimeRenderer(mglw.WindowConfig):
                 camera * glm.vec4(float(pos[0]), float(pos[1]), float(pos[2]), 1.0),
                 dtype=np.float32,
             )
-            view_positions.append((float(view[0]), float(view[1]), float(view[2])))
+            view_positions.append((float(view[0]), float(view[1]), float(view[2]), 1.0))
         self._light_positions_view = np.array(view_positions, dtype=np.float32)
 
     def _apply_lights_to_mesh(self, mesh) -> None:
