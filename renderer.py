@@ -12,6 +12,7 @@ import moderngl_window as mglw
 import numpy as np
 import glm
 from moderngl_window.resources.programs import programs as _mglw_programs
+from moderngl_window.conf import settings
 from moderngl_window.integrations.imgui import ModernGLRenderer, ModernglWindowMixin
 from moderngl_window.scene.camera import OrbitCamera
 from PIL import Image
@@ -233,6 +234,10 @@ class RealtimeRenderer(mglw.WindowConfig):
 
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
+        shader_dir = Path(__file__).resolve().parent / "shaders"
+        shader_dir_str = str(shader_dir)
+        if shader_dir_str not in [str(path) for path in settings.PROGRAM_DIRS]:
+            settings.PROGRAM_DIRS.append(shader_dir_str)
         self.assets = load_assets_config(ASSETS_ROOT)
         self.nt_client = NetworkTablesClient()
         imgui.create_context()
