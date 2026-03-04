@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from math import atan2
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, cast
 
 import imgui
 import moderngl
@@ -89,6 +89,53 @@ class FuelInstance:
     matrix: np.ndarray
 
 
+@dataclass
+class Renderable:
+    mesh: Any
+    program: moderngl.Program | None
+    base_matrix: glm.mat4
+    model_matrix: glm.mat4
+    is_transparent: bool
+    active: bool = True
+
+
+@dataclass
+class ProgramUniformCache:
+    program: moderngl.Program
+    light_pos: Any | None
+    light_color: Any | None
+    specular_strength: Any | None
+    shininess: Any | None
+    last_version: int = -1
+
+    def update_lights(
+        self,
+        positions_bytes: bytes,
+        colors_bytes: bytes,
+        specular_strength: float,
+        shininess: float,
+        version: int,
+    ) -> None:
+        if self.last_version == version:
+            return
+        if self.light_pos is not None:
+            self.light_pos.write(positions_bytes)
+        if self.light_color is not None:
+            self.light_color.write(colors_bytes)
+        if self.specular_strength is not None:
+            self.specular_strength.value = specular_strength
+        if self.shininess is not None:
+            self.shininess.value = shininess
+        self.last_version = version
+
+
+@dataclass
+class AprilTagDrawable:
+    model_matrix: glm.mat4
+    scale_matrix: glm.mat4
+    tag_id: int
+
+
 class AprilTagRenderer:
     def __init__(self, ctx: moderngl.Context) -> None:
         self.ctx = ctx
@@ -115,6 +162,7 @@ class AprilTagRenderer:
             }
             """,
         )
+        self.mvp_uniform = cast(Any, self.program["mvp"])
         vertices = np.array(
             [
                 -0.005,
@@ -165,7 +213,7 @@ class AprilTagRenderer:
     def render(self, mvp_bytes: bytes, tag_id: int) -> None:
         texture = self.load_texture(tag_id)
         texture.use(location=0)
-        self.program["mvp"].write(mvp_bytes)
+        self.mvp_uniform.write(mvp_bytes)
         self.vao.render()
 
 
@@ -304,8 +352,24 @@ class RealtimeRenderer(mglw.WindowConfig):
         self._light_positions_view = np.column_stack(
             (self._light_positions_world, np.ones(len(self._light_positions_world), dtype=np.float32))
         )
-        self._light_program_cache: set[int] = set()
+        self._light_positions_view_bytes = self._light_positions_view.tobytes()
+        self._light_colors_bytes = self._light_colors.tobytes()
+        self._light_state_version = 0
+        self._specular_strength = 0.6
+        self._shininess = 32.0
+        self._program_uniforms: dict[int, ProgramUniformCache] = {}
         self._staged_fuel_nodes: dict[Any, Any] = {}
+        self._camera_pos = glm.vec3(0.0, 0.0, 0.0)
+        self.static_drawables: list[Renderable] = []
+        self.dynamic_drawables: list[Renderable] = []
+        self._opaque_drawables: list[Renderable] = []
+        self._transparent_drawables: list[Renderable] = []
+        self._robot_drawables: list[Renderable] = []
+        self._component_drawables: list[list[Renderable]] = []
+        self._fuel_templates: list[Renderable] = []
+        self._fuel_drawables: list[Renderable] = []
+        self._fuel_active_count = 0
+        self._apriltag_drawables: list[AprilTagDrawable] = []
 
     def _to_glm(self, matrix: np.ndarray) -> glm.mat4:
         return glm.mat4(*matrix.flatten(order="F").tolist())
@@ -339,7 +403,110 @@ class RealtimeRenderer(mglw.WindowConfig):
                     continue
                 if self._normalize_mesh_name(node.name) in staged_set:
                     self._staged_fuel_nodes[node] = node.mesh
+        self._build_renderables()
         self._scenes_loaded = True
+
+    def _iter_scene_meshes(self, scene: mglw.scene.Scene) -> list[tuple[Any, glm.mat4]]:
+        meshes: list[tuple[Any, glm.mat4]] = []
+        stack = list(scene.root_nodes)
+        while stack:
+            node = stack.pop()
+            mesh = getattr(node, "mesh", None)
+            if mesh is not None:
+                meshes.append((mesh, node.matrix_global))
+            stack.extend(getattr(node, "children", []))
+        return meshes
+
+    def _register_renderable(self, renderable: Renderable, is_dynamic: bool) -> None:
+        if is_dynamic:
+            self.dynamic_drawables.append(renderable)
+        else:
+            self.static_drawables.append(renderable)
+        if renderable.is_transparent:
+            self._transparent_drawables.append(renderable)
+        else:
+            self._opaque_drawables.append(renderable)
+
+    def _build_renderables(self) -> None:
+        self.static_drawables.clear()
+        self.dynamic_drawables.clear()
+        self._opaque_drawables.clear()
+        self._transparent_drawables.clear()
+        self._robot_drawables.clear()
+        self._component_drawables.clear()
+        self._fuel_templates.clear()
+        self._fuel_drawables.clear()
+        self._fuel_active_count = 0
+        self._apriltag_drawables.clear()
+
+        field_base_glm = self._to_glm(self.field_base_matrix)
+
+        if self.field_scene is not None:
+            self.field_scene.matrix = glm.mat4(1.0)
+            for mesh, node_matrix in self._iter_scene_meshes(self.field_scene):
+                model = field_base_glm * node_matrix
+                renderable = Renderable(
+                    mesh=mesh,
+                    program=getattr(getattr(mesh, "mesh_program", None), "program", None),
+                    base_matrix=node_matrix,
+                    model_matrix=model,
+                    is_transparent=self._mesh_requires_blend(mesh),
+                )
+                self._register_renderable(renderable, is_dynamic=False)
+
+        if self.robot_scene is not None:
+            self.robot_scene.matrix = glm.mat4(1.0)
+            for mesh, node_matrix in self._iter_scene_meshes(self.robot_scene):
+                renderable = Renderable(
+                    mesh=mesh,
+                    program=getattr(getattr(mesh, "mesh_program", None), "program", None),
+                    base_matrix=node_matrix,
+                    model_matrix=node_matrix,
+                    is_transparent=self._mesh_requires_blend(mesh),
+                )
+                self._robot_drawables.append(renderable)
+                self._register_renderable(renderable, is_dynamic=True)
+
+        for component_scene in self.robot_components:
+            component_scene.matrix = glm.mat4(1.0)
+            component_drawables: list[Renderable] = []
+            for mesh, node_matrix in self._iter_scene_meshes(component_scene):
+                renderable = Renderable(
+                    mesh=mesh,
+                    program=getattr(getattr(mesh, "mesh_program", None), "program", None),
+                    base_matrix=node_matrix,
+                    model_matrix=node_matrix,
+                    is_transparent=self._mesh_requires_blend(mesh),
+                )
+                component_drawables.append(renderable)
+                self._register_renderable(renderable, is_dynamic=True)
+            self._component_drawables.append(component_drawables)
+
+        if self.fuel_scene is not None:
+            self.fuel_scene.matrix = glm.mat4(1.0)
+            for mesh, node_matrix in self._iter_scene_meshes(self.fuel_scene):
+                template = Renderable(
+                    mesh=mesh,
+                    program=getattr(getattr(mesh, "mesh_program", None), "program", None),
+                    base_matrix=node_matrix,
+                    model_matrix=node_matrix,
+                    is_transparent=self._mesh_requires_blend(mesh),
+                )
+                self._fuel_templates.append(template)
+
+        self._build_apriltag_drawables()
+
+    def _build_apriltag_drawables(self) -> None:
+        wpilib_glm = self._to_glm(self.wpilib_matrix)
+        for tag in self.assets.field.april_tags:
+            size = self._apriltag_size(tag.variant)
+            scale = self._glm_scale(0.01, size, size)
+            tag_model = wpilib_glm * self._to_glm(
+                pose_matrix(Pose3d(tag.position, tuple(rotation_sequence_to_quat(tag.rotations))))
+            )
+            self._apriltag_drawables.append(
+                AprilTagDrawable(model_matrix=tag_model, scale_matrix=scale, tag_id=tag.tag_id)
+            )
 
     def _camera_from_driver_station(self, index: int) -> tuple[np.ndarray, np.ndarray]:
         stations = self.assets.field.driver_stations
@@ -438,15 +605,13 @@ class RealtimeRenderer(mglw.WindowConfig):
         result = matrix @ vec
         return result[:3]
 
-    def _robot_pose_matrix(self) -> np.ndarray:
-        pose2d = self.nt_client.get_pose2d()
+    def _robot_pose_matrix_from_pose(self, pose2d) -> np.ndarray:
         x, y, theta = self._convert_pose2d(pose2d.x, pose2d.y, pose2d.theta)
         base_pose = pose2d_matrix(x, y, theta)
         return self.wpilib_matrix @ base_pose @ self.robot_base_matrix
 
-    def _component_matrices(self) -> list[np.ndarray]:
-        robot_pose = self.nt_client.get_pose2d()
-        x, y, theta = self._convert_pose2d(robot_pose.x, robot_pose.y, robot_pose.theta)
+    def _component_matrices_from_pose(self, pose2d) -> list[np.ndarray]:
+        x, y, theta = self._convert_pose2d(pose2d.x, pose2d.y, pose2d.theta)
         robot_pose_matrix = pose2d_matrix(x, y, theta)
         component_poses = self.nt_client.get_mechanism_poses()
         matrices: list[np.ndarray] = []
@@ -466,14 +631,6 @@ class RealtimeRenderer(mglw.WindowConfig):
             )
             matrices.append(self.wpilib_matrix @ robot_pose_matrix @ user_pose @ config_pose)
         return matrices
-
-    def _fuel_instances(self, positions: list[tuple[float, float, float]]) -> list[FuelInstance]:
-        fuels = []
-        for position in positions:
-            converted = self._convert_translation(position[0], position[1], position[2])
-            matrix = self.wpilib_matrix @ pose_matrix(Pose3d(converted, (1.0, 0.0, 0.0, 0.0)))
-            fuels.append(FuelInstance(matrix=matrix))
-        return fuels
 
     def _set_staged_fuel_visible(self, visible: bool) -> None:
         for node, mesh in self._staged_fuel_nodes.items():
@@ -496,99 +653,158 @@ class RealtimeRenderer(mglw.WindowConfig):
                 dtype=np.float32,
             )
             view_positions.append((float(view[0]), float(view[1]), float(view[2]), 1.0))
-        self._light_positions_view = np.array(view_positions, dtype=np.float32)
+        updated = np.array(view_positions, dtype=np.float32)
+        updated_bytes = updated.tobytes()
+        if updated_bytes != self._light_positions_view_bytes:
+            self._light_positions_view = updated
+            self._light_positions_view_bytes = updated_bytes
+            self._light_state_version += 1
 
-    def _apply_lights_to_mesh(self, mesh) -> None:
-        mesh_program = getattr(mesh, "mesh_program", None)
-        if mesh_program is None:
-            return
-        program = getattr(mesh_program, "program", None)
+    def _get_program_cache(self, program: moderngl.Program) -> ProgramUniformCache:
+        program_id = id(program)
+        cache = self._program_uniforms.get(program_id)
+        if cache is not None:
+            return cache
+
+        def _get_uniform(name: str) -> Any | None:
+            try:
+                return program[name]
+            except KeyError:
+                return None
+
+        cache = ProgramUniformCache(
+            program=program,
+            light_pos=_get_uniform("u_light_pos"),
+            light_color=_get_uniform("u_light_color"),
+            specular_strength=_get_uniform("u_specular_strength"),
+            shininess=_get_uniform("u_shininess"),
+        )
+        self._program_uniforms[program_id] = cache
+        return cache
+
+    def _apply_lights_to_program(self, program: moderngl.Program | None) -> None:
         if program is None:
             return
-        program_id = id(program)
-        if program_id in self._light_program_cache:
+        cache = self._get_program_cache(program)
+        cache.update_lights(
+            self._light_positions_view_bytes,
+            self._light_colors_bytes,
+            self._specular_strength,
+            self._shininess,
+            self._light_state_version,
+        )
+
+    def _ensure_fuel_drawables(self, instance_count: int) -> None:
+        if instance_count <= 0 or not self._fuel_templates:
             return
-        self._light_program_cache.add(program_id)
-        try:
-            program["u_light_pos"].write(self._light_positions_view.tobytes())
-            program["u_light_color"].write(self._light_colors.tobytes())
-            program["u_specular_strength"].value = 0.6
-            program["u_shininess"].value = 32.0
-        except KeyError:
+        template_count = len(self._fuel_templates)
+        needed = instance_count * template_count
+        while len(self._fuel_drawables) < needed:
+            template = self._fuel_templates[len(self._fuel_drawables) % template_count]
+            renderable = Renderable(
+                mesh=template.mesh,
+                program=template.program,
+                base_matrix=template.base_matrix,
+                model_matrix=template.base_matrix,
+                is_transparent=template.is_transparent,
+                active=False,
+            )
+            self._fuel_drawables.append(renderable)
+            self._register_renderable(renderable, is_dynamic=True)
+        self._fuel_active_count = needed
+
+    def _update_dynamic_transforms(self, fuel_positions: list[tuple[float, float, float]]) -> None:
+        pose2d = self.nt_client.get_pose2d()
+        self.last_robot_pose = self._robot_pose_matrix_from_pose(pose2d)
+        robot_root = self._to_glm(self.last_robot_pose)
+        for renderable in self._robot_drawables:
+            renderable.model_matrix = glm.mat4(robot_root * renderable.base_matrix)
+
+        component_matrices = self._component_matrices_from_pose(pose2d)
+        for index, component_drawables in enumerate(self._component_drawables):
+            if index < len(component_matrices):
+                component_root = self._to_glm(component_matrices[index])
+            else:
+                component_root = glm.mat4(1.0)
+            for renderable in component_drawables:
+                renderable.model_matrix = glm.mat4(component_root * renderable.base_matrix)
+
+        instance_count = len(fuel_positions)
+        if instance_count == 0 or not self._fuel_templates:
+            for renderable in self._fuel_drawables:
+                renderable.active = False
+            self._fuel_active_count = 0
             return
 
-    def _collect_drawables(
-        self, node, drawables: list[tuple[Callable[..., None], Any, bool]]
-    ) -> None:
-        mesh = getattr(node, "mesh", None)
-        if mesh is not None:
-            def _draw_fn(projection: glm.mat4, model: glm.mat4, camera: glm.mat4) -> None:
-                self._apply_lights_to_mesh(mesh)
-                mesh.draw(projection_matrix=projection, model_matrix=model, camera_matrix=camera)
+        self._ensure_fuel_drawables(instance_count)
+        template_count = len(self._fuel_templates)
+        active_needed = instance_count * template_count
+        for index, renderable in enumerate(self._fuel_drawables):
+            renderable.active = index < active_needed
 
-            drawables.append((_draw_fn, node.matrix_global, self._mesh_requires_blend(mesh)))
-        for child in getattr(node, "children", []):
-            self._collect_drawables(child, drawables)
+        for index, position in enumerate(fuel_positions):
+            converted = self._convert_translation(position[0], position[1], position[2])
+            fuel_matrix = self.wpilib_matrix @ pose_matrix(Pose3d(converted, (1.0, 0.0, 0.0, 0.0)))
+            fuel_root = self._to_glm(fuel_matrix)
+            base_index = index * template_count
+            for template_index in range(template_count):
+                renderable = self._fuel_drawables[base_index + template_index]
+                renderable.model_matrix = glm.mat4(
+                    fuel_root * self._fuel_templates[template_index].base_matrix
+                )
 
-    def _collect_scene_drawables(
-        self, scene: mglw.scene.Scene, matrix: np.ndarray, drawables: list[tuple[Callable[..., None], Any, bool]]
-    ) -> None:
-        scene.matrix = self._to_glm(matrix)
-        for node in scene.root_nodes:
-            self._collect_drawables(node, drawables)
-
-    def _collect_apriltag_drawables(self, drawables: list[tuple[Callable[..., None], Any, bool]]) -> None:
-        wpilib_glm = self._to_glm(self.wpilib_matrix)
-        for tag in self.assets.field.april_tags:
-            size = self._apriltag_size(tag.variant)
-            scale = self._glm_scale(0.01, size, size)
-            tag_model = wpilib_glm * self._to_glm(
-                pose_matrix(Pose3d(tag.position, tuple(rotation_sequence_to_quat(tag.rotations))))
+    def _render_mesh_drawables(self, renderables: list[Renderable], projection: glm.mat4, camera: glm.mat4) -> None:
+        current_program_id: int | None = None
+        for renderable in renderables:
+            if not renderable.active:
+                continue
+            program = renderable.program
+            if program is not None:
+                program_id = id(program)
+                if program_id != current_program_id:
+                    current_program_id = program_id
+                    self._apply_lights_to_program(program)
+            renderable.mesh.draw(
+                projection_matrix=projection,
+                model_matrix=renderable.model_matrix,
+                camera_matrix=camera,
             )
 
-            def _draw_fn(
-                projection: glm.mat4,
-                model: glm.mat4,
-                camera: glm.mat4,
-                scale=scale,
-                tag_id=tag.tag_id,
-            ) -> None:
-                mvp = projection * camera * model * scale
-                self.tag_renderer.render(self._glm_to_bytes(glm.mat4(mvp)), tag_id)
-
-            drawables.append((_draw_fn, tag_model, True))
-
-    def _render_drawables(self, drawables: list[tuple[Callable[..., None], Any, bool]]) -> None:
-        if not drawables:
+    def _render_apriltag_drawables(self, projection: glm.mat4, camera: glm.mat4) -> None:
+        if not self._apriltag_drawables:
             return
+        for tag_drawable in self._apriltag_drawables:
+            mvp = projection * camera * tag_drawable.model_matrix * tag_drawable.scale_matrix
+            self.tag_renderer.render(self._glm_to_bytes(glm.mat4(mvp)), tag_drawable.tag_id)
+
+    def _render_cached_drawables(self) -> None:
         projection = self._camera_projection()
         camera = self._camera_view()
         self._update_light_positions_view(camera)
-        self._light_program_cache.clear()
-        opaque = [(draw_fn, model) for draw_fn, model, is_transparent in drawables if not is_transparent]
-        transparent = [(draw_fn, model) for draw_fn, model, is_transparent in drawables if is_transparent]
 
         self.ctx.disable(moderngl.BLEND)
         self.ctx.depth_mask = True
-        for draw_fn, model in opaque:
-            draw_fn(projection, model, camera)
+        self._render_mesh_drawables(self._opaque_drawables, projection, camera)
 
-        if transparent:
-            cam_pos = glm.vec3(glm.inverse(camera)[3])
+        if self._transparent_drawables or self._apriltag_drawables:
+            self._camera_pos = glm.vec3(glm.inverse(camera)[3])
+            active_count = sum(1 for renderable in self._transparent_drawables if renderable.active)
+            if active_count > 1:
+                self._transparent_drawables.sort(key=self._distance_sq_from_renderable, reverse=True)
 
-            def _distance_sq(model: glm.mat4) -> float:
-                world_pos = glm.vec3(model[3])
-                diff = world_pos - cam_pos
-                return float(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z)
-
-            transparent.sort(key=lambda item: _distance_sq(item[1]), reverse=True)
             self.ctx.enable(moderngl.BLEND)
             self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
             self.ctx.depth_mask = False
-            for draw_fn, model in transparent:
-                draw_fn(projection, model, camera)
+            if self._transparent_drawables:
+                self._render_mesh_drawables(self._transparent_drawables, projection, camera)
+            self._render_apriltag_drawables(projection, camera)
             self.ctx.depth_mask = True
             self.ctx.disable(moderngl.BLEND)
+
+    def _distance_sq_from_renderable(self, renderable: Renderable) -> float:
+        world_pos = glm.vec3(renderable.model_matrix[3])
+        diff = world_pos - self._camera_pos
+        return float(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z)
 
     def render(self, time: float, frame_time: float) -> None:
         self.ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
@@ -603,23 +819,8 @@ class RealtimeRenderer(mglw.WindowConfig):
         fuel_positions = self.nt_client.get_fuel_positions()
         self._set_staged_fuel_visible(len(fuel_positions) == 0)
 
-        if self.field_scene is None or self.robot_scene is None or self.fuel_scene is None:
-            return
-
-        drawables: list[tuple[Callable[..., None], Any, bool]] = []
-        self._collect_scene_drawables(self.field_scene, self.field_base_matrix, drawables)
-        self.last_robot_pose = self._robot_pose_matrix()
-        self._collect_scene_drawables(self.robot_scene, self.last_robot_pose, drawables)
-
-        for component_scene, matrix in zip(self.robot_components, self._component_matrices()):
-            self._collect_scene_drawables(component_scene, matrix, drawables)
-
-        for fuel in self._fuel_instances(fuel_positions):
-            self._collect_scene_drawables(self.fuel_scene, fuel.matrix, drawables)
-
-        self._collect_apriltag_drawables(drawables)
-
-        self._render_drawables(drawables)
+        self._update_dynamic_transforms(fuel_positions)
+        self._render_cached_drawables()
         self._render_ui()
 
     def _apply_keyboard_controls(self, frame_time: float) -> None:
@@ -652,24 +853,6 @@ class RealtimeRenderer(mglw.WindowConfig):
 
     def on_render(self, time: float, frame_time: float) -> None:
         self.render(time, frame_time)
-
-    def _render_apriltags(self) -> None:
-        self.ctx.enable(moderngl.BLEND)
-        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
-        self.ctx.depth_mask = False
-        for tag in self.assets.field.april_tags:
-            size = self._apriltag_size(tag.variant)
-            scale = self._glm_scale(0.01, size, size)
-            mvp = (
-                self._camera_projection()
-                * self._camera_view()
-                * self._to_glm(self.wpilib_matrix)
-                * self._to_glm(pose_matrix(Pose3d(tag.position, tuple(rotation_sequence_to_quat(tag.rotations)))))
-                * scale
-            )
-            self.tag_renderer.render(self._glm_to_bytes(glm.mat4(mvp)), tag.tag_id)
-        self.ctx.depth_mask = True
-        self.ctx.disable(moderngl.BLEND)
 
     def _apriltag_size(self, variant: str) -> float:
         parts = variant.split("-")
