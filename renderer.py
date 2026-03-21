@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from enum import Enum
 from math import atan2
 from pathlib import Path
+import threading
+import requests
+import io
+import logging
 from typing import Any, Callable
 import copy
 
@@ -32,11 +36,202 @@ from nt_client import NetworkTablesClient
 ASSETS_ROOT = Path(__file__).resolve().parent / "assets"
 TEXTURE_ROOT = Path(__file__).resolve().parent / "textures"
 
+logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")
+
+# === LOAD CONSTANTS FROM CONFIG.JSON ===
+import json
+
+
+import re
+
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+if not CONFIG_PATH.exists():
+    raise RuntimeError(f"Missing config.json at {CONFIG_PATH}")
+
+
+def _strip_json_comments(text):
+    # Remove // comments
+    text = re.sub(r"//.*", "", text)
+    # Remove /* ... */ comments
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return text
+
+
+with open(CONFIG_PATH, encoding="utf-8") as f:
+    _config_data = json.loads(_strip_json_comments(f.read()))
+
+
+def _get_required_config(key):
+    if key not in _config_data:
+        raise RuntimeError(f"Missing required config key: '{key}' in config.json")
+    return _config_data[key]
+
+
+TEAM_NUMBER_POOL = _get_required_config("team-pool")
+THIS_TEAM = _get_required_config("team")
+MATCH_TYPE = _get_required_config("match-type")
+MATCH_NUMBER = _get_required_config("match-number")
+MATCH_TOTAL = _get_required_config("match-total")
+GAME_YEAR = _get_required_config("year")
+
+import random
+
+
+class TeamAssignmentManager:
+    def __init__(self, nt_client):
+        self.nt_client = nt_client
+        self.last_alliance_station = None
+        self.red_team_numbers = [None, None, None]
+        self.blue_team_numbers = [None, None, None]
+        self._update_team_numbers()
+
+    def _update_team_numbers(self):
+        alliance_station = self.nt_client.get_alliance_station()
+        if alliance_station == self.last_alliance_station:
+            return
+        self.last_alliance_station = alliance_station
+        # Alliance station mapping: 1=red1, 2=red2, 3=red3, 4=blue1, 5=blue2, 6=blue3
+        # Indices: 0=first, 1=second, 2=third
+        red = [None, None, None]
+        blue = [None, None, None]
+        pool = TEAM_NUMBER_POOL.copy()
+        # Place THIS_TEAM
+        if 1 <= alliance_station <= 3:
+            idx = alliance_station - 1
+            red[idx] = THIS_TEAM
+        elif 4 <= alliance_station <= 6:
+            idx = alliance_station - 4
+            blue[idx] = THIS_TEAM
+        # Fill remaining spots from pool, seeded by alliance_station
+        rng = random.Random(alliance_station)
+        pool = [t for t in pool if t != THIS_TEAM]
+        rng.shuffle(pool)
+        pool_idx = 0
+        for i in range(3):
+            if red[i] is None:
+                red[i] = pool[pool_idx]
+                pool_idx += 1
+        for i in range(3):
+            if blue[i] is None:
+                blue[i] = pool[pool_idx]
+                pool_idx += 1
+        self.red_team_numbers = [str(n) for n in red]
+        self.blue_team_numbers = [str(n) for n in blue]
+
+    def get_red_team_numbers(self):
+        self._update_team_numbers()
+        return self.red_team_numbers
+
+    def get_blue_team_numbers(self):
+        self._update_team_numbers()
+        return self.blue_team_numbers
+
+
+# === TEAM LOGO CONSTANTS ===
+LOGO_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / f"logos_{GAME_YEAR}"
+LOGO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class TeamLogoCache:
+    def __init__(self):
+        self._mem_cache = (
+            {}
+        )  # (team_number: int) -> PIL.Image or None (None=loading/failed)
+        self._lock = threading.Lock()
+
+    def get_logo(self, team_number: str, callback=None):
+        # Remove leading zeros, ensure int
+        try:
+            team = int(team_number)
+        except Exception as e:
+            logging.error(f"Invalid team number '{team_number}': {e}")
+            return None
+        # Check memory cache
+        with self._lock:
+            if team in self._mem_cache:
+                return self._mem_cache[team]
+            # Mark as loading
+            self._mem_cache[team] = None
+            logging.debug(
+                f"Logo for team {team} not in memory cache, starting async load."
+            )
+        # Start async load
+        threading.Thread(
+            target=self._load_logo, args=(team, callback), daemon=True
+        ).start()
+        return None
+
+    def _load_logo(self, team, callback):
+        # Disk cache path
+        cache_path = LOGO_CACHE_DIR / f"{team}.png"
+        img = None
+        if cache_path.exists():
+            try:
+                img = Image.open(cache_path).convert("RGBA")
+                logging.info(
+                    f"Loaded logo for team {team} from disk cache: {cache_path}"
+                )
+            except Exception as e:
+                logging.error(f"Failed to load logo for team {team} from disk: {e}")
+                img = None
+        else:
+            url = f"https://www.thebluealliance.com/avatar/{GAME_YEAR}/frc{team}.png"
+            try:
+                logging.info(f"Downloading logo for team {team} from {url}")
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                    img.save(cache_path)
+                    logging.info(
+                        f"Downloaded and cached logo for team {team} at {cache_path}"
+                    )
+                elif resp.status_code == 403:
+                    # Forbidden: use placeholder
+                    logging.warning(
+                        f"Logo fetch forbidden for team {team} in {GAME_YEAR}, using placeholder."
+                    )
+                    import shutil
+
+                    placeholder_path = (
+                        Path(__file__).resolve().parent
+                        / "logos"
+                        / "FIRSTicon_RGB_withTM.png"
+                    )
+                    try:
+                        shutil.copy(placeholder_path, cache_path)
+                        img = Image.open(cache_path).convert("RGBA")
+                        logging.info(
+                            f"Copied placeholder logo for team {team} to {cache_path}"
+                        )
+                    except Exception as e:
+                        logging.error(
+                            f"Failed to copy placeholder logo for team {team}: {e}"
+                        )
+                        img = None
+                else:
+                    logging.warning(
+                        f"Failed to download logo for team {team}: HTTP {resp.status_code}"
+                    )
+            except Exception as e:
+                logging.error(f"Exception downloading logo for team {team}: {e}")
+                img = None
+        with self._lock:
+            self._mem_cache[team] = img
+            logging.debug(f"Logo for team {team} set in memory cache: {img}")
+        if callback:
+            callback(team, img)
+
+
+team_logo_cache = TeamLogoCache()
+
 DS_CAMERA_HEIGHT = 62 * 0.0254
 DS_CAMERA_OFFSET_FRC = 1.5
-ORBIT_FIELD_FRC_DEFAULT_TARGET = np.array([0.0, 0.5, 0.0], dtype=np.float32)
+
+ORBIT_FIELD_FRC_DEFAULT_TARGET = np.array(
+    [0.0, 1.32, 0.0], dtype=np.float32
+)  # Center of field
+ORBIT_FIELD_FRC_DEFAULT_RADIUS = 11
 ORBIT_ROBOT_FRC_DEFAULT_TARGET = np.array([0.0, 0.5, 0.0], dtype=np.float32)
-ORBIT_FIELD_FRC_DEFAULT_POSITION = np.array([0.0, 6.0, -12.0], dtype=np.float32)
 ORBIT_ROBOT_FRC_DEFAULT_POSITION = np.array([2.0, 1.0, 1.0], dtype=np.float32)
 
 WPILIB_ROTATION = rotation_sequence_to_quat(
@@ -246,23 +441,52 @@ class RealtimeRenderer(mglw.WindowConfig):
         settings.PROGRAM_DIRS = [shader_dir_str]
         self.assets = load_assets_config(ASSETS_ROOT)
         self.nt_client = NetworkTablesClient()
+        self.team_assignment = TeamAssignmentManager(self.nt_client)
         imgui.create_context()
         self.imgui = ImGuiBridge(self.wnd, self.ctx)
+
+        io = imgui.get_io()
+
+        self._ui_font_base_size = 128
+        self._ui_font_target_size = 32
+        self._ui_font_small_size = int(self._ui_font_base_size / 1.5)
+        self._ui_font_big_size = int(self._ui_font_base_size * 1.5)
+        self._ui_font_large_size = int(self._ui_font_base_size * 1.4)
+        self._ui_font = io.fonts.add_font_from_file_ttf(
+            "fonts/Roboto-Bold.ttf",
+            self._ui_font_base_size,
+        )
+        self._ui_font_small = io.fonts.add_font_from_file_ttf(
+            "fonts/Roboto-Bold.ttf",
+            self._ui_font_small_size,
+        )
+        self._ui_font_big = io.fonts.add_font_from_file_ttf(
+            "fonts/Roboto-Bold.ttf",
+            self._ui_font_big_size,
+        )
+        self._ui_font_large = io.fonts.add_font_from_file_ttf(
+            "fonts/Roboto-Bold.ttf",
+            self._ui_font_large_size,
+        )
+        self.imgui.renderer.refresh_font_texture()
+
         self.wnd.swap_interval = 0
         self._field_length_m = self.assets.field.width_inches * 0.0254
         self._field_width_m = self.assets.field.height_inches * 0.0254
         self._coordinate_system = self.assets.field.coordinate_system
+
+        # Bumper foam dynamic color state
+        self._foam_mesh = None
+        self._foam_material = None
+        self._foam_original_color = None
         self.camera = OrbitCamera(
             target=(
                 float(ORBIT_FIELD_FRC_DEFAULT_TARGET[0]),
                 float(ORBIT_FIELD_FRC_DEFAULT_TARGET[1]),
                 float(ORBIT_FIELD_FRC_DEFAULT_TARGET[2]),
             ),
-            radius=float(
-                np.linalg.norm(
-                    ORBIT_FIELD_FRC_DEFAULT_POSITION - ORBIT_FIELD_FRC_DEFAULT_TARGET
-                )
-            ),
+            angles=(-90, -57.2),
+            radius=ORBIT_FIELD_FRC_DEFAULT_RADIUS,
         )
         self.camera.projection.update(
             aspect_ratio=self.wnd.aspect_ratio, fov=50.0, near=0.1, far=100.0
@@ -537,7 +761,39 @@ class RealtimeRenderer(mglw.WindowConfig):
                     self._staged_fuel_nodes[node] = node.mesh
         if self.field_scene is not None:
             self._collect_hub_diffusers()
+
+        # Find foam mesh/material in robot_scene
+        self._foam_mesh = None
+        self._foam_material = None
+        self._foam_original_color = None
+        if self.robot_scene is not None:
+            for node in getattr(self.robot_scene, "nodes", []):
+                if node.mesh is not None and node.name and node.name.lower() == "foam":
+                    self._foam_mesh = node.mesh
+                    self._foam_material = getattr(self._foam_mesh, "material", None)
+                    if self._foam_material is not None and hasattr(
+                        self._foam_material, "color"
+                    ):
+                        # Store original color as tuple
+                        self._foam_original_color = tuple(self._foam_material.color)
+                    break
         self._scenes_loaded = True
+
+    def _update_bumper_foam_color(self):
+        """Set foam color to red for alliance station 1-3, else restore original blue."""
+        if self._foam_material is None or self._foam_original_color is None:
+            return
+        alliance_station = self.nt_client.get_alliance_station()
+        if 1 <= alliance_station <= 3:
+            # Set to red #FF0707, RGBA
+            self._foam_material.color = (1.0, 0.027, 0.027, 1.0)
+        else:
+            # Restore original blue, ensure 4-tuple
+            orig = self._foam_original_color
+            if len(orig) == 3:
+                self._foam_material.color = (orig[0], orig[1], orig[2], 1.0)
+            else:
+                self._foam_material.color = orig
 
     def _collect_hub_diffusers(self) -> None:
         hub_names = {
@@ -671,13 +927,17 @@ class RealtimeRenderer(mglw.WindowConfig):
     def _update_camera(self) -> None:
         if self.view_mode != self._last_view_mode:
             if self.view_mode == ViewMode.ORBIT_FIELD:
-                field_pos = self._transform_point(
-                    self.wpilib_matrix, ORBIT_FIELD_FRC_DEFAULT_POSITION
-                )
                 field_target = self._transform_point(
                     self.wpilib_matrix, ORBIT_FIELD_FRC_DEFAULT_TARGET
                 )
-                self._set_orbit_from_position(field_pos, field_target)
+                self.camera.target = glm.vec3(
+                    float(field_target[0]),
+                    float(field_target[1]),
+                    float(field_target[2]),
+                )
+                self.camera.radius = ORBIT_FIELD_FRC_DEFAULT_RADIUS
+                self.camera.angle_x = -90
+                self.camera.angle_y = -57.2
             elif self.view_mode == ViewMode.ORBIT_ROBOT:
                 robot_pos = np.array(self.last_robot_pose[:3, 3], dtype=np.float32)
                 robot_offset = (
@@ -924,6 +1184,7 @@ class RealtimeRenderer(mglw.WindowConfig):
         self._apply_keyboard_controls(frame_time)
 
         self._load_scenes()
+        self._update_bumper_foam_color()
         if not self._scenes_loaded:
             return
 
@@ -1120,27 +1381,527 @@ class RealtimeRenderer(mglw.WindowConfig):
 
     def _render_ui(self) -> None:
         imgui.new_frame()
-        imgui.set_next_window_position(16, 16, imgui.FIRST_USE_EVER)
-        imgui.begin("View", True, imgui.WINDOW_ALWAYS_AUTO_RESIZE)
-        current_index = list(ViewMode).index(self.view_mode)
-        changed, new_index = imgui.combo(
-            "Camera",
-            current_index,
-            [mode.value for mode in ViewMode],
+
+        if self._ui_font is not None:
+            imgui.push_font(self._ui_font)
+
+        io = imgui.get_io()
+        width, height = io.display_size
+
+        # === UNIFORM SCALE FACTOR (based on 1920x1080 reference) ===
+        base_width = 1920.0
+        base_height = 1080.0
+        scale = min(width / base_width, height / base_height)
+        offset_x = (width - base_width * scale) / 2.0
+        offset_y = 0.0
+        io.font_global_scale = scale * (
+            self._ui_font_target_size / self._ui_font_base_size
         )
-        if changed:
-            self.view_mode = list(ViewMode)[new_index]
-        imgui.text("NetworkTables: 127.0.0.1")
-        red_active = self.nt_client.get_red_hub_active()
-        blue_active = self.nt_client.get_blue_hub_active()
-        red_score = round(self.nt_client.get_red_score())
-        blue_score = round(self.nt_client.get_blue_score())
-        imgui.separator()
-        imgui.text(f"Red Hub Active: {red_active}")
-        imgui.text(f"Blue Hub Active: {blue_active}")
-        imgui.text(f"Red Score: {red_score}")
-        imgui.text(f"Blue Score: {blue_score}")
-        imgui.end()
+
+        def S(x, y):
+            return offset_x + x * scale, offset_y + y * scale
+
+        def rect(x, y, w, h, color):
+            draw = imgui.get_background_draw_list()
+            x, y = S(x, y)
+            w, h = w * scale, h * scale
+            draw.add_rect_filled(x, y, x + w, y + h, color, 0)
+
+        def text(x, y, txt, size=20, color=(255, 255, 255, 255), center=False):
+            draw = imgui.get_background_draw_list()
+            x, y = S(x, y)
+
+            if center:
+                tw, th = imgui.calc_text_size(txt)
+                x -= tw / 2
+                y -= th / 2
+
+            draw.add_text(
+                x,
+                y,
+                imgui.get_color_u32_rgba(
+                    color[0] / 255, color[1] / 255, color[2] / 255, color[3] / 255
+                ),
+                txt,
+            )
+
+        def text_small(x, y, txt, color=(255, 255, 255, 255), center=False):
+            imgui.pop_font()
+            imgui.push_font(self._ui_font_small)
+            text(x, y, txt, size=20, color=color, center=center)
+            imgui.pop_font()
+            imgui.push_font(self._ui_font)
+
+        def text_big(x, y, txt, color=(255, 255, 255, 255), center=False):
+            imgui.pop_font()
+            imgui.push_font(self._ui_font_big)
+            text(x, y, txt, size=20, color=color, center=center)
+            imgui.pop_font()
+            imgui.push_font(self._ui_font)
+
+        def text_large(x, y, txt, color=(255, 255, 255, 255), center=False):
+            imgui.pop_font()
+            imgui.push_font(self._ui_font_large)
+            text(x, y, txt, size=20, color=color, center=center)
+            imgui.pop_font()
+            imgui.push_font(self._ui_font)
+
+        # === COLORS ===
+        BLUE = (30 / 255, 90 / 255, 200 / 255, 1)
+        RED = (200 / 255, 40 / 255, 40 / 255, 1)
+        DARK = (20 / 255, 20 / 255, 25 / 255, 1)
+        WHITE = (1, 1, 1, 1)
+        BLUE_TEAM_OUTER = (0 / 255, 64 / 255, 115 / 255, 1)
+        BLUE_TEAM_CENTER = (0 / 255, 46 / 255, 84 / 255, 1)
+        RED_TEAM_OUTER = (130 / 255, 12 / 255, 19 / 255, 1)
+        RED_TEAM_CENTER = (97 / 255, 9 / 255, 12 / 255, 1)
+
+        def col(c):
+            return imgui.get_color_u32_rgba(*c)
+
+        # =========================
+        # CENTER TIMER PANEL (background first)
+        # =========================
+        rect(450, 15, 1020, 45, col(DARK))
+        rect(450, 60, 1020, 70, col(WHITE))
+
+        # =========================
+        # LEFT BLUE PANEL
+        # =========================
+        rect(450, 60, 450, 70, col(BLUE))
+
+        blue_score = int(self.nt_client.get_blue_score())
+
+        # Team numbers panel (blue) 330x60, bottom-left of blue panel
+        blue_team_x = 450
+        blue_team_y = 70
+        team_panel_w = 330
+        team_panel_h = 60
+        team_cell_w = team_panel_w / 3
+
+        # Blue score: center in area to right of team numbers, same height, bottom aligned
+        blue_score_x0 = blue_team_x + team_panel_w
+        blue_score_x1 = 450 + 450  # end of blue panel
+        blue_score_w = blue_score_x1 - blue_score_x0
+        blue_score_h = team_panel_h
+        blue_score_cx = blue_score_x0 + blue_score_w / 2
+        blue_score_cy = blue_team_y + team_panel_h  # bottom edge
+        # Center vertically in the height of the team panel, but bottom aligned
+        text_big(
+            blue_score_cx,
+            blue_score_cy - blue_score_h / 2,
+            f"{blue_score}",
+            center=True,
+        )
+
+        blue_team_numbers = self.team_assignment.get_blue_team_numbers()
+        for index in range(3):
+            cell_x = blue_team_x + team_cell_w * index
+            cell_color = BLUE_TEAM_CENTER if index == 1 else BLUE_TEAM_OUTER
+            rect(cell_x, blue_team_y, team_cell_w, team_panel_h, col(cell_color))
+            # --- Team logo ---
+            logo_x = cell_x + 12
+            logo_y = blue_team_y + 15
+            logo_w = 30
+            logo_h = 30
+            team_num = blue_team_numbers[index]
+            logo_img = team_logo_cache.get_logo(team_num)
+            if logo_img is not None:
+                try:
+                    if not hasattr(logo_img, "_imgui_tex_id"):
+                        logging.info(
+                            f"Uploading logo for team {team_num} to GPU and registering with ImGui."
+                        )
+                        tex = self.ctx.texture(logo_img.size, 4, logo_img.tobytes())
+                        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+                        self.imgui.renderer.register_texture(tex)
+                        logo_img._imgui_tex_id = tex.glo
+                        logo_img._mgl_tex = tex  # Prevent GC
+                        logging.info(
+                            f"Registered logo for team {team_num} with ImGui tex_id={tex.glo}, tex={tex}"
+                        )
+                    imgui.get_background_draw_list().add_image(
+                        logo_img._imgui_tex_id,
+                        S(logo_x, logo_y),
+                        S(logo_x + logo_w, logo_y + logo_h),
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to render logo for team {team_num}: {e}")
+                    rect(logo_x, logo_y, logo_w, logo_h, col(WHITE))
+            else:
+                logging.debug(
+                    f"Logo for team {team_num} not loaded yet, drawing placeholder."
+                )
+                rect(logo_x, logo_y, logo_w, logo_h, col(WHITE))
+            text_small(
+                cell_x + (team_cell_w + 30) / 2,
+                blue_team_y + 30,
+                team_num,
+                center=True,
+            )
+
+        # =========================
+        # RIGHT RED PANEL
+        # =========================
+        rect(1020, 60, 450, 70, col(RED))
+
+        red_score = int(self.nt_client.get_red_score())
+
+        # Team numbers panel (red) 330x60, bottom-right of red panel
+        red_team_x = 1140
+        red_team_y = 70
+
+        # Red score: center in area to left of team numbers, same height, bottom aligned
+        red_score_x0 = 1020  # start of red panel
+        red_score_x1 = red_team_x  # start of team numbers
+        red_score_w = red_score_x1 - red_score_x0
+        red_score_h = team_panel_h
+        red_score_cx = red_score_x0 + red_score_w / 2
+        red_score_cy = red_team_y + team_panel_h  # bottom edge
+        # Center vertically in the height of the team panel, but bottom aligned
+        text_big(
+            red_score_cx,
+            red_score_cy - red_score_h / 2,
+            f"{red_score}",
+            center=True,
+        )
+
+        red_team_numbers = self.team_assignment.get_red_team_numbers()
+        for index in range(3):
+            cell_x = red_team_x + team_cell_w * index
+            cell_color = RED_TEAM_CENTER if index == 1 else RED_TEAM_OUTER
+            rect(cell_x, red_team_y, team_cell_w, team_panel_h, col(cell_color))
+            # --- Team logo ---
+            logo_x = cell_x + 12
+            logo_y = red_team_y + 15
+            logo_w = 30
+            logo_h = 30
+            team_num = red_team_numbers[index]
+            logo_img = team_logo_cache.get_logo(team_num)
+            if logo_img is not None:
+                try:
+                    if not hasattr(logo_img, "_imgui_tex_id"):
+                        logging.info(
+                            f"Uploading logo for team {team_num} to GPU and registering with ImGui."
+                        )
+                        tex = self.ctx.texture(logo_img.size, 4, logo_img.tobytes())
+                        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+                        self.imgui.renderer.register_texture(tex)
+                        logo_img._imgui_tex_id = tex.glo
+                        logo_img._mgl_tex = tex  # Prevent GC
+                        logging.info(
+                            f"Registered logo for team {team_num} with ImGui tex_id={tex.glo}, tex={tex}"
+                        )
+                    imgui.get_background_draw_list().add_image(
+                        logo_img._imgui_tex_id,
+                        S(logo_x, logo_y),
+                        S(logo_x + logo_w, logo_y + logo_h),
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to render logo for team {team_num}: {e}")
+                    rect(logo_x, logo_y, logo_w, logo_h, col(WHITE))
+            else:
+                logging.debug(
+                    f"Logo for team {team_num} not loaded yet, drawing placeholder."
+                )
+                rect(logo_x, logo_y, logo_w, logo_h, col(WHITE))
+            text_small(
+                cell_x + (team_cell_w + 30) / 2,
+                red_team_y + 30,
+                team_num,
+                center=True,
+            )
+
+        # Match time from NT
+        match_time = int(self.nt_client.get_match_time())
+        is_waiting_for_match = match_time < 0
+        if is_waiting_for_match:
+            match_time = 140
+        minutes = match_time // 60
+        seconds = match_time % 60
+
+        time_str = f"{minutes}:{seconds:02d}"
+
+        # Centered and bottom-aligned in the timer panel, same height as team number panel
+        timer_panel_y = 70
+        timer_panel_h = 60
+        timer_panel_x = 450
+        timer_panel_w = 1020
+        timer_cy = timer_panel_y + timer_panel_h  # bottom edge
+        text_large(
+            960,
+            timer_cy - timer_panel_h / 2,
+            time_str,
+            center=True,
+            color=(0, 0, 0, 255),
+        )
+
+        # =========================
+        # SHIFT TIMER PANEL (directly below time container)
+        # =========================
+
+        if not self.nt_client.get_autonomous():
+            shift_panel_y = timer_panel_y + timer_panel_h + 1  # 1px border below
+            shift_panel_h = 38
+            # The blue and red background panels are at x=450, width=450, and x=1020, width=450
+            shift_panel_x = 450 + 450  # right edge of blue panel
+            shift_panel_w = (
+                1020 - shift_panel_x
+            )  # left edge of red panel minus right edge of blue panel
+            # Draw border (1px #DDDBDC) between match time and shift timer panel
+            border_col = imgui.get_color_u32_rgba(0xDD / 255, 0xDB / 255, 0xDC / 255, 1)
+            draw = imgui.get_background_draw_list()
+            # Horizontal divider line at top of shift panel
+            x0, y0 = S(shift_panel_x, shift_panel_y - 1)
+            x1, y1 = S(shift_panel_x + shift_panel_w, shift_panel_y)
+            draw.add_rect_filled(x0, y0, x1, y1 + 1.0, border_col, 0)
+            # Outer border for the shift timer panel
+            x0b, y0b = S(shift_panel_x, shift_panel_y)
+            x1b, y1b = S(shift_panel_x + shift_panel_w, shift_panel_y + shift_panel_h)
+            draw.add_rect(x0b, y0b, x1b, y1b, border_col, 0, 1.0 * scale)
+
+            shift_num = (
+                1
+                if match_time > 130
+                else (
+                    2
+                    if match_time > 105
+                    else (
+                        3
+                        if match_time > 80
+                        else 4 if match_time > 55 else 5 if match_time > 30 else 6
+                    )
+                )
+            )
+
+            shift_time_left = match_time - (
+                130
+                if shift_num == 1
+                else (
+                    105
+                    if shift_num == 2
+                    else (
+                        80
+                        if shift_num == 3
+                        else 55 if shift_num == 4 else 30 if shift_num == 5 else 0
+                    )
+                )
+            )
+
+            # Shift count panel (75px wide, white bg, black text)
+            shift_count_w = 75
+            shift_count_x = shift_panel_x
+            shift_count_y = shift_panel_y
+            rect(shift_count_x, shift_count_y, shift_count_w, shift_panel_h, col(WHITE))
+            text(
+                shift_count_x + shift_count_w / 2,
+                shift_count_y + shift_panel_h / 2,
+                f"{shift_num} / 6",
+                color=(0, 0, 0, 255),
+                center=True,
+            )
+
+            # Shift timer panel (remaining width, #DDDBDC bg, black text)
+            shift_timer_x = shift_count_x + shift_count_w
+            shift_timer_w = shift_panel_w - shift_count_w
+            rect(shift_timer_x, shift_count_y, shift_timer_w, shift_panel_h, border_col)
+            text_small(
+                shift_timer_x + shift_timer_w / 2,
+                shift_count_y + shift_panel_h / 2,
+                f":{shift_time_left:02d}",
+                color=(0, 0, 0, 255),
+                center=True,
+            )
+
+        # =========================
+        # TOP LABEL TEXTS
+        # =========================
+        text(
+            960,
+            37.5,
+            f"{["Match", "Practice", "Qualification", "Playoff Match"][max(0, min(3, MATCH_TYPE))]} {MATCH_NUMBER} of {MATCH_TOTAL}",
+            size=20,
+            center=True,
+        )
+
+        # Left logo placeholder (now with static image)
+        rect(450, 15, 180, 45, col((0.9, 0.9, 0.9, 1)))
+        # Draw static image: logos/first_age_logo_horizontal_rgb_onecolor.png
+        if not hasattr(self, "_first_age_logo_tex"):
+            try:
+                logo_path = (
+                    Path(__file__).resolve().parent
+                    / "logos"
+                    / "first_age_logo_horizontal_rgb_onecolor.png"
+                )
+                logo_img = Image.open(logo_path).convert("RGBA")
+                tex = self.ctx.texture(logo_img.size, 4, logo_img.tobytes())
+                self.imgui.renderer.register_texture(tex)
+                self._first_age_logo_tex = tex.glo
+                self._first_age_logo_mgl = tex  # Prevent GC
+            except Exception as e:
+                logging.error(f"Failed to load FIRST AGE logo image: {e}")
+                self._first_age_logo_tex = None
+        if self._first_age_logo_tex is not None:
+            imgui.get_background_draw_list().add_image(
+                self._first_age_logo_tex,
+                S(450, 15),
+                S(450 + 180, 15 + 45),
+            )
+        # else: fallback to nothing (background remains white)
+
+        # Right logo placeholder
+        rect(1290, 15, 180, 45, col((0.9, 0.9, 0.9, 1)))
+        # Draw static image: logos/first_age_frc_rebuilt_wordmark_rgb_black.png
+        if not hasattr(self, "_rebuilt_logo_tex"):
+            try:
+                rebuilt_logo_path = (
+                    Path(__file__).resolve().parent
+                    / "logos"
+                    / "first_age_frc_rebuilt_wordmark_rgb_black.png"
+                )
+                rebuilt_logo_img = Image.open(rebuilt_logo_path).convert("RGBA")
+                rebuilt_tex = self.ctx.texture(
+                    rebuilt_logo_img.size, 4, rebuilt_logo_img.tobytes()
+                )
+                self.imgui.renderer.register_texture(rebuilt_tex)
+                self._rebuilt_logo_tex = rebuilt_tex.glo
+                self._rebuilt_logo_mgl = rebuilt_tex  # Prevent GC
+            except Exception as e:
+                logging.error(f"Failed to load REBUILT logo image: {e}")
+                self._rebuilt_logo_tex = None
+        if self._rebuilt_logo_tex is not None:
+            imgui.get_background_draw_list().add_image(
+                self._rebuilt_logo_tex,
+                S(1290, 15),
+                S(1290 + 180, 15 + 45),
+            )
+        # else: fallback to nothing (background remains gray)
+
+        # =========================
+
+        # LEFT STACK COUNTER
+        # =========================
+        rect(35, 67, 45, 45, col(WHITE))
+        # Draw blue fuel icon on top of white square
+        if not hasattr(self, "_fuelblue_tex"):
+            try:
+                fuelblue_path = (
+                    Path(__file__).resolve().parent / "logos" / "fuelblue.png"
+                )
+                fuelblue_img = Image.open(fuelblue_path).convert("RGBA")
+                fuelblue_tex = self.ctx.texture(
+                    fuelblue_img.size, 4, fuelblue_img.tobytes()
+                )
+                self.imgui.renderer.register_texture(fuelblue_tex)
+                self._fuelblue_tex = fuelblue_tex.glo
+                self._fuelblue_mgl = fuelblue_tex  # Prevent GC
+                self._fuelblue_size = fuelblue_img.size
+            except Exception as e:
+                logging.error(f"Failed to load fuelblue icon: {e}")
+                self._fuelblue_tex = None
+        if self._fuelblue_tex is not None:
+            # Center icon in 45x45 square at (35,67)
+            icon_w, icon_h = 45, 45
+            x0, y0 = S(35 + (45 - icon_w) / 2, 67 + (45 - icon_h) / 2)
+            x1, y1 = S(35 + (45 + icon_w) / 2, 67 + (45 + icon_h) / 2)
+            imgui.get_background_draw_list().add_image(
+                self._fuelblue_tex,
+                (x0, y0),
+                (x1, y1),
+            )
+        rect(80, 67, 150, 45, col(BLUE))
+        ranking_target_blue = 300 if blue_score >= 100 else 100
+        text(155, 89.5, f"{blue_score} / {ranking_target_blue}", size=18, center=True)
+
+        # Show left arrow only if blue hub is active
+        if self.nt_client.get_blue_hub_active():
+            rect(302, 67, 45, 45, col((1, 1, 0, 1)))
+            # Draw left arrow image (flipped horizontally)
+            if not hasattr(self, "_arrow_tex"):
+                try:
+                    arrow_path = Path(__file__).resolve().parent / "logos" / "arrow.png"
+                    arrow_img = Image.open(arrow_path).convert("RGBA")
+                    arrow_tex = self.ctx.texture(arrow_img.size, 4, arrow_img.tobytes())
+                    self.imgui.renderer.register_texture(arrow_tex)
+                    self._arrow_tex = arrow_tex.glo
+                    self._arrow_mgl = arrow_tex  # Prevent GC
+                    self._arrow_size = arrow_img.size
+                except Exception as e:
+                    logging.error(f"Failed to load arrow image: {e}")
+                    self._arrow_tex = None
+            if self._arrow_tex is not None:
+                # Draw flipped horizontally for left arrow
+                x0, y0 = S(302, 67)
+                x1, y1 = S(302 + 45, 67 + 45)
+                imgui.get_background_draw_list().add_image(
+                    self._arrow_tex,
+                    (x1, y0),  # flip x
+                    (x0, y1),
+                )
+            # else: fallback to nothing (background remains yellow)
+
+        # =========================
+
+        # RIGHT STACK COUNTER
+        # =========================
+        if self.nt_client.get_red_hub_active():
+            rect(1573, 67, 45, 45, col((1, 1, 0, 1)))
+            # Draw right arrow image (normal orientation)
+            if not hasattr(self, "_arrow_tex"):
+                try:
+                    arrow_path = Path(__file__).resolve().parent / "logos" / "arrow.png"
+                    arrow_img = Image.open(arrow_path).convert("RGBA")
+                    arrow_tex = self.ctx.texture(arrow_img.size, 4, arrow_img.tobytes())
+                    self.imgui.renderer.register_texture(arrow_tex)
+                    self._arrow_tex = arrow_tex.glo
+                    self._arrow_mgl = arrow_tex  # Prevent GC
+                    self._arrow_size = arrow_img.size
+                except Exception as e:
+                    logging.error(f"Failed to load arrow image: {e}")
+                    self._arrow_tex = None
+            if self._arrow_tex is not None:
+                x0, y0 = S(1573, 67)
+                x1, y1 = S(1573 + 45, 67 + 45)
+                imgui.get_background_draw_list().add_image(
+                    self._arrow_tex,
+                    (x0, y0),
+                    (x1, y1),
+                )
+            # else: fallback to nothing (background remains yellow)
+        rect(1689, 67, 45, 45, col(WHITE))
+        # Draw red fuel icon on top of white square
+        if not hasattr(self, "_fuelred_tex"):
+            try:
+                fuelred_path = Path(__file__).resolve().parent / "logos" / "fuelred.png"
+                fuelred_img = Image.open(fuelred_path).convert("RGBA")
+                fuelred_tex = self.ctx.texture(
+                    fuelred_img.size, 4, fuelred_img.tobytes()
+                )
+                self.imgui.renderer.register_texture(fuelred_tex)
+                self._fuelred_tex = fuelred_tex.glo
+                self._fuelred_mgl = fuelred_tex  # Prevent GC
+                self._fuelred_size = fuelred_img.size
+            except Exception as e:
+                logging.error(f"Failed to load fuelred icon: {e}")
+                self._fuelred_tex = None
+        if self._fuelred_tex is not None:
+            # Center icon in 45x45 square at (1689,67)
+            icon_w, icon_h = 45, 45
+            x0, y0 = S(1689 + (45 - icon_w) / 2, 67 + (45 - icon_h) / 2)
+            x1, y1 = S(1689 + (45 + icon_w) / 2, 67 + (45 + icon_h) / 2)
+            imgui.get_background_draw_list().add_image(
+                self._fuelred_tex,
+                (x0, y0),
+                (x1, y1),
+            )
+        rect(1734, 67, 150, 45, col(RED))
+        ranking_target_red = 300 if red_score >= 100 else 100
+        text(1809, 89.5, f"{red_score} / {ranking_target_red}", size=18, center=True)
+
+        if self._ui_font is not None:
+            imgui.pop_font()
+
         imgui.render()
         self.imgui.render(imgui.get_draw_data())
 
@@ -1207,7 +1968,19 @@ class RealtimeRenderer(mglw.WindowConfig):
 
     def key_event(self, key: int, action: int, modifiers) -> None:
         self.imgui.key_event(key, action, modifiers)
+        # Alt+Enter fullscreen toggle
+        keys = self.wnd.keys
+        is_alt = False
+        # modifiers can be int (bitmask) or object with .alt attribute
+        if hasattr(modifiers, "alt"):
+            is_alt = bool(getattr(modifiers, "alt", False))
+        elif isinstance(modifiers, int):
+            # moderngl_window uses bitmask: 0x0008 for Alt
+            is_alt = (modifiers & 0x0008) != 0
         if action == self.wnd.keys.ACTION_PRESS:
+            if is_alt and key == keys.ENTER:
+                # Toggle fullscreen
+                self.wnd.fullscreen = not self.wnd.fullscreen
             self._keys_pressed.add(key)
         elif action == self.wnd.keys.ACTION_RELEASE:
             self._keys_pressed.discard(key)

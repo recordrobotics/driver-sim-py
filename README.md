@@ -18,11 +18,15 @@ pip install -r requirements.txt
 python main.py
 ```
 
+Configuration can be changed in [`config.json`](config.json)
+
 The viewer connects to NetworkTables at `127.0.0.1` and subscribes to:
 
 - `/AdvantageKit/RealOutputs/RobotModel/Robot`
 - `/AdvantageKit/RealOutputs/RobotModel/MechanismPoses`
 - `/AdvantageKit/RealOutputs/RobotModel/FuelPositions`
+
+as well as other AdvantageKit values
 
 ## Notes
 

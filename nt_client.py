@@ -10,6 +10,8 @@ POSE2D_PATH = "/AdvantageKit/RealOutputs/RobotModel/Robot"
 MECHANISM_PATH = "/AdvantageKit/RealOutputs/RobotModel/MechanismPoses"
 FUEL_PATH = "/AdvantageKit/RealOutputs/RobotModel/FuelPositions"
 MATCH_TIME_PATH = "/AdvantageKit/DriverStation/MatchTime"
+AUTONOMOUS_PATH = "/AdvantageKit/DriverStation/Autonomous"
+ALLIANCE_STATION_PATH = "/AdvantageKit/DriverStation/AllianceStation"
 
 RED_HUB_ACTIVE_PATH = (
     "/SmartDashboard/MapleSim/MatchData/Breakdown/Red Alliance/Improved Active"
@@ -45,6 +47,7 @@ class Pose3dData:
 
 
 class NetworkTablesClient:
+
     def __init__(self, server: str = "127.0.0.1", period: float = 0.02) -> None:
         self._instance = NetworkTableInstance.getDefault()
         self._instance.startClient4("advantage-viewer")
@@ -61,6 +64,9 @@ class NetworkTablesClient:
         self._fuel_sub = self._instance.getStructArrayTopic(
             FUEL_PATH, Pose3d
         ).subscribe([], options)
+        self._match_time_sub = self._instance.getDoubleTopic(MATCH_TIME_PATH).subscribe(
+            0.0, options
+        )
         self._red_hub_active_sub = self._instance.getBooleanTopic(
             RED_HUB_ACTIVE_PATH
         ).subscribe(False, options)
@@ -73,6 +79,19 @@ class NetworkTablesClient:
         self._blue_score_sub = self._instance.getDoubleTopic(BLUE_SCORE_PATH).subscribe(
             0.0, options
         )
+        self._autonomous_sub = self._instance.getBooleanTopic(
+            AUTONOMOUS_PATH
+        ).subscribe(False, options)
+
+        self._alliance_station_sub = self._instance.getIntegerTopic(
+            ALLIANCE_STATION_PATH
+        ).subscribe(1, options)
+
+    def get_autonomous(self) -> bool:
+        return bool(self._autonomous_sub.get())
+
+    def get_alliance_station(self) -> int:
+        return int(self._alliance_station_sub.get())
 
     def get_pose2d(self) -> Pose2dData:
         pose = self._pose2d_sub.get()
@@ -89,6 +108,9 @@ class NetworkTablesClient:
     def get_fuel_positions(self) -> list[tuple[float, float, float]]:
         poses = self._fuel_sub.get()
         return [(pose.x, pose.y, pose.z) for pose in _pose3d_structs_to_data(poses)]
+
+    def get_match_time(self) -> float:
+        return float(self._match_time_sub.get())
 
     def get_red_hub_active(self) -> bool:
         return bool(self._red_hub_active_sub.get())

@@ -1,0 +1,14 @@
+{
+    "year": 2026,
+    "team": 6731,
+    "team-pool": [
+        151,
+        69,
+        97,
+        4169,
+        246
+    ],
+    "match-type": 2, // ["n", "p", "q", "e"]
+    "match-number": 42,
+    "match-total": 76
+}
