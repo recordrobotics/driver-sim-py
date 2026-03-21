@@ -43,7 +43,7 @@ void main()
     vec3 v = normalize(-pos);
     vec4 tex = texture(texture0, uv);
     vec3 base = tex.rgb;
-    vec3 ambient = base * 0.2;
+    vec3 ambient = base * 0.4;
     vec3 lighting = vec3(0.0);
     for (int i = 0; i < 3; i++) {
     vec3 l = normalize(u_light_pos[i].xyz - pos);
