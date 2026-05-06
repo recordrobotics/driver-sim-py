@@ -22,12 +22,11 @@ from moderngl_window.integrations.imgui import ModernGLRenderer, ModernglWindowM
 from moderngl_window.scene.camera import OrbitCamera
 from PIL import Image
 
+from wpimath.geometry import Pose3d, Rotation3d
+
 from config import Rotation, load_assets_config
 from math_utils import (
-    Pose3d,
     compose,
-    pose2d_matrix,
-    pose_matrix,
     rotation_sequence_to_quat,
 )
 from nt_client import NetworkTablesClient
@@ -87,6 +86,9 @@ class TeamAssignmentManager:
 
     def _update_team_numbers(self):
         alliance_station = self.nt_client.get_alliance_station()
+        if(alliance_station < 1 or alliance_station > 6):
+            alliance_station = 1  # Default to red1 if invalid
+            
         if alliance_station == self.last_alliance_station:
             return
         self.last_alliance_station = alliance_station
@@ -501,24 +503,23 @@ class RealtimeRenderer(mglw.WindowConfig):
         self.fuel_scene: mglw.scene.Scene | None = None
         self._scenes_loaded = False
         self.tag_renderer = AprilTagRenderer(self.ctx)
-        self.wpilib_matrix = pose_matrix(
-            Pose3d((0.0, 0.0, 0.0), tuple(WPILIB_ROTATION.tolist()))
-        )
+        self.wpilib_matrix = Pose3d(0.0, 0.0, 0.0, Rotation3d(WPILIB_ROTATION)).toMatrix()
         self.field_base_matrix = compose(
             self.wpilib_matrix,
-            pose_matrix(
-                Pose3d(
-                    self.assets.field.position,
-                    tuple(rotation_sequence_to_quat(self.assets.field.rotations)),
-                )
-            ),
-        )
-        self.robot_base_matrix = pose_matrix(
             Pose3d(
-                self.assets.robot.position,
-                tuple(rotation_sequence_to_quat(self.assets.robot.rotations)),
-            )
+                self.assets.field.position[0],
+                self.assets.field.position[1],
+                self.assets.field.position[2],
+                Rotation3d(rotation_sequence_to_quat(self.assets.field.rotations)),
+            ).toMatrix(),
         )
+        self.robot_base_matrix = Pose3d(
+                self.assets.robot.position[0],
+                self.assets.robot.position[1],
+                self.assets.robot.position[2],
+                Rotation3d(rotation_sequence_to_quat(self.assets.robot.rotations))
+            ).toMatrix()
+        
         self._light_colors = np.array(
             [
                 (0.25, 0.45, 1.0, 1.0),
@@ -880,24 +881,24 @@ class RealtimeRenderer(mglw.WindowConfig):
         target = self._transform_point(self.wpilib_matrix, target)
         return camera_pos, target
 
-    def _convert_pose2d(
-        self, x: float, y: float, theta: float
-    ) -> tuple[float, float, float]:
+    def _convert_pose3d(self, pose3d: Pose3d) -> Pose3d:
         if self._coordinate_system == "wall-blue":
-            return (
-                self._field_length_m / 2.0 - x,
-                self._field_width_m / 2.0 - y,
-                theta + np.pi,
+            return Pose3d(
+                self._field_length_m / 2.0 - pose3d.X(),
+                self._field_width_m / 2.0 - pose3d.Y(),
+                pose3d.Z(),
+                pose3d.rotation().rotateBy(Rotation3d(0,0,np.pi)),
             )
         if self._coordinate_system == "center-rotated":
-            return (y, -x, theta - np.pi / 2.0)
+            return Pose3d(pose3d.Y(), -pose3d.X(), pose3d.Z(), pose3d.rotation().rotateBy(Rotation3d(0,0,-np.pi/2)))
         if self._coordinate_system == "wall-alliance":
-            return (
-                self._field_length_m / 2.0 - x,
-                self._field_width_m / 2.0 - y,
-                theta + np.pi,
+            return Pose3d(
+                self._field_length_m / 2.0 - pose3d.X(),
+                self._field_width_m / 2.0 - pose3d.Y(),
+                pose3d.Z(),
+                pose3d.rotation().rotateBy(Rotation3d(0,0,np.pi)),
             )
-        return (x, y, theta)
+        return pose3d
 
     def _convert_translation(
         self, x: float, y: float, z: float
@@ -992,47 +993,44 @@ class RealtimeRenderer(mglw.WindowConfig):
         return result[:3]
 
     def _robot_pose_matrix(self) -> np.ndarray:
-        pose2d = self.nt_client.get_pose2d()
-        x, y, theta = self._convert_pose2d(pose2d.x, pose2d.y, pose2d.theta)
-        base_pose = pose2d_matrix(x, y, theta)
+        pose3d = self.nt_client.get_pose3d()
+        pose3d = self._convert_pose3d(pose3d)
+        base_pose = pose3d.toMatrix()
         return self.wpilib_matrix @ base_pose @ self.robot_base_matrix
 
     def _component_matrices(self) -> list[np.ndarray]:
-        robot_pose = self.nt_client.get_pose2d()
-        x, y, theta = self._convert_pose2d(robot_pose.x, robot_pose.y, robot_pose.theta)
-        robot_pose_matrix = pose2d_matrix(x, y, theta)
+        pose3d = self.nt_client.get_pose3d()
+        pose3d = self._convert_pose3d(pose3d)
+        robot_pose_matrix = pose3d.toMatrix()
         component_poses = self.nt_client.get_mechanism_poses()
         matrices: list[np.ndarray] = []
         for index, component in enumerate(self.assets.robot.components):
             if index < len(component_poses):
                 pose = component_poses[index]
-                user_pose = pose_matrix(
-                    Pose3d(
-                        (pose.x, pose.y, pose.z), (pose.qw, pose.qx, pose.qy, pose.qz)
-                    )
-                )
+                user_pose = pose.toMatrix()
             else:
                 user_pose = np.eye(4, dtype=np.float32)
-            config_pose = pose_matrix(
-                Pose3d(
-                    component.zeroed_position,
-                    tuple(rotation_sequence_to_quat(component.zeroed_rotations)),
-                )
-            )
+            config_pose = Pose3d(
+                    component.zeroed_position[0],
+                    component.zeroed_position[1],
+                    component.zeroed_position[2],
+                    Rotation3d(rotation_sequence_to_quat(component.zeroed_rotations)),
+                ).toMatrix()
+            
             matrices.append(
                 self.wpilib_matrix @ robot_pose_matrix @ user_pose @ config_pose
             )
         return matrices
 
     def _fuel_instances(
-        self, positions: list[tuple[float, float, float]]
+        self, positions: list[Pose3d]
     ) -> list[FuelInstance]:
         fuels = []
         for position in positions:
-            converted = self._convert_translation(position[0], position[1], position[2])
-            matrix = self.wpilib_matrix @ pose_matrix(
-                Pose3d(converted, (1.0, 0.0, 0.0, 0.0))
-            )
+            converted = self._convert_translation(position.X(), position.Y(), position.Z())
+            matrix = self.wpilib_matrix @ (
+                Pose3d(converted[0], converted[1], converted[2], Rotation3d(0, 0, 0))
+            ).toMatrix()
             fuels.append(FuelInstance(matrix=matrix))
         return fuels
 
@@ -1118,11 +1116,14 @@ class RealtimeRenderer(mglw.WindowConfig):
             size = self._apriltag_size(tag.variant)
             scale = self._glm_scale(0.01, size, size)
             tag_model = wpilib_glm * self._to_glm(
-                pose_matrix(
+                (
                     Pose3d(
-                        tag.position, tuple(rotation_sequence_to_quat(tag.rotations))
+                        tag.position[0],
+                        tag.position[1],
+                        tag.position[2],
+                        Rotation3d(rotation_sequence_to_quat(tag.rotations))
                     )
-                )
+                ).toMatrix()
             )
 
             def _draw_fn(
@@ -1343,12 +1344,14 @@ class RealtimeRenderer(mglw.WindowConfig):
                 * self._camera_view()
                 * self._to_glm(self.wpilib_matrix)
                 * self._to_glm(
-                    pose_matrix(
+                    (
                         Pose3d(
-                            tag.position,
-                            tuple(rotation_sequence_to_quat(tag.rotations)),
+                            tag.position[0],
+                            tag.position[1],
+                            tag.position[2],
+                            Rotation3d(rotation_sequence_to_quat(tag.rotations)),
                         )
-                    )
+                    ).toMatrix()
                 )
                 * scale
             )
