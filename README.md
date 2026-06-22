@@ -2,6 +2,8 @@
 
 A lightweight Python viewer that renders the AdvantageScope 3D field and streams live data from NetworkTables.
 
+**NOTE: This project has been rewritten in C++ and moved to https://github.com/recordrobotics/driver-sim**
+
 ## Requirements
 
 - Python 3.12
